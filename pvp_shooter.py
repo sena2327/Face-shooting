@@ -364,10 +364,6 @@ def draw_hud(
     fps_y: int,
     player_world_x: float,
     player_world_y: float,
-    item_slots,
-    item_slot_icons,
-    item_selected: int,
-    item_blink_until: float,
     rel_smile: float,
     rel_frown: float,
     rel_browh: float,
@@ -437,42 +433,6 @@ def draw_hud(
         (200, 220, 200),
         2,
     )
-
-    slot_count = len(item_slots) if item_slots is not None else 0
-    # Item bar (square slots at bottom-left)
-    slot_size = 48
-    slot_gap = 8
-    base_x = 12
-    base_y = SCR_H - 80
-    now_t = time.time()
-    for idx in range(slot_count):
-        x1 = base_x + idx * (slot_size + slot_gap)
-        y1 = base_y
-        x2 = x1 + slot_size
-        y2 = y1 + slot_size
-        col = (80, 80, 80)
-        thickness = 1
-        if idx == item_selected:
-            # Blink highlight for a short time after item use
-            if now_t < item_blink_until:
-                col = (255, 255, 255)
-                thickness = 3
-            else:
-                col = (200, 255, 200)
-                thickness = 2
-        cv2.rectangle(img, (x1, y1), (x2, y2), col, thickness)
-        # draw item icon in the slot if present
-        if item_slots[idx]:
-            kind = item_slots[idx][-1]
-            if 0 <= kind < len(item_slot_icons):
-                icon = item_slot_icons[kind]
-                if icon is not None:
-                    ih, iw = icon.shape[:2]
-                    cx_s = (x1 + x2) // 2
-                    cy_s = (y1 + y2) // 2
-                    sx = cx_s - iw // 2
-                    sy = cy_s - ih // 2
-                    img[:] = blend_rgba(img, icon, xoff=sx, yoff=sy, alpha_scale=1.0)
 
     cv2.putText(
         img,
@@ -575,7 +535,6 @@ def main():
                 print(f"[P2P_FACE] setup failed: {e}")
         except Exception as e:
             print(f"[P2P] setup failed: {e}")
-    pvp_mode = peer_host is not None
 
     if is_authority:
         tcp_listen_port = args.listen_port
@@ -588,32 +547,18 @@ def main():
     enemy_tcp = EnemySyncTCP(is_authority=is_authority)
     pending_enemy_events: deque[tuple[str, list[str]]] = deque()
 
-    if pvp_mode:
-        game_phase = GAME_PHASE_WAIT_CALIB_SYNC
-        local_calib_ready = False
-        remote_calib_ready = False
-        calib_active = False
-        calib_start_sent = False
-    else:
-        game_phase = GAME_PHASE_CALIBRATING
-        local_calib_ready = True
-        remote_calib_ready = True
-        calib_active = True
-        calib_start_sent = True
-    # Track whether local readiness has been sent (for manual trigger)
-    local_ready_sent = False
+    game_phase = GAME_PHASE_WAIT_CALIB_SYNC
+    local_calib_ready = False
+    remote_calib_ready = False
+    calib_active = False
+    calib_start_sent = False
 
-    def announce_local_calib_ready() -> None:
-        """Deprecated: readiness is now triggered manually (e.g. by key press)."""
-        return
-
-    if pvp_mode:
-        def _start_enemy_tcp():
-            try:
-                enemy_tcp.start(args.listen_ip, tcp_listen_port, tcp_connect_host, tcp_connect_port)
-            except Exception as exc:
-                print(f"[ENEMY-TCP] setup failed: {exc}")
-        threading.Thread(target=_start_enemy_tcp, daemon=True).start()
+    def _start_enemy_tcp():
+        try:
+            enemy_tcp.start(args.listen_ip, tcp_listen_port, tcp_connect_host, tcp_connect_port)
+        except Exception as exc:
+            print(f"[ENEMY-TCP] setup failed: {exc}")
+    threading.Thread(target=_start_enemy_tcp, daemon=True).start()
 
     # --- Initialize sound (pygame.mixer) ---
     pygame.mixer.init()
@@ -668,13 +613,6 @@ def main():
     # --- Field item pickups (dropped from defeated enemies) ---
     items = []
     ITEM_DROP_PROB = 0.05  # 5% drop chance per defeated enemy
-    # --- Item system (3 slots bottom-left, stack-based; single-player parity) ---
-    item_slots = [[], [], []]
-    item_selected = 0          # start at leftmost; 0: left, 1: middle, 2: right
-    last_item_move_t = 0.0  # legacy (kept for parity, unused once edge-trigger takes over)
-    prev_item_use = False
-    prev_brow_high = False
-    item_blink_until = 0.0
 
     player_hp_max = 30
     player_hp = player_hp_max
@@ -721,6 +659,13 @@ def main():
             return random.randint(0, len(item_world_sprites) - 1)
         return -1
 
+    def apply_item_effect(kind: int) -> None:
+        nonlocal player_hp, attack_bonus
+        if kind == 0:
+            player_hp = min(player_hp_max, player_hp + 2)
+        elif kind == 1:
+            attack_bonus += 3
+
     def add_player_exp(points: int) -> None:
         nonlocal player_xp, player_level
         player_xp += points
@@ -732,7 +677,7 @@ def main():
             player_level += 1
 
     def grant_kill_rewards(killer_id: int, target_obj: Target | None) -> None:
-        nonlocal score, items, item_blink_until
+        nonlocal score, items
         if killer_id != player_id or target_obj is None:
             return
         reward_score = int(100 * getattr(target_obj, "hp_max", 1))
@@ -743,7 +688,6 @@ def main():
             spr = item_world_sprites[drop_kind]
             if spr is not None:
                 items.append(ItemPickup(float(target_obj.x), float(target_obj.y), drop_kind, spr))
-                item_blink_until = time.time() + 0.3
 
     def detach_enemy(enemy_uid: int) -> tuple[int | None, Target | None]:
         info = enemy_lookup.pop(enemy_uid, None)
@@ -910,28 +854,23 @@ def main():
         except Exception as e:
             print(f"[P2P_FACE] send thread start failed: {e}")
 
-    # --- Load item sprites (field pickups + HUD icons) ---
-    def _load_item_rgba(path, world_size=64, slot_size=40):
+    # --- Load item sprites (field pickups only) ---
+    def _load_item_rgba(path, world_size=64):
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img is None:
             print(f"[WARN] Item sprite not found: {path}")
-            return None, None
+            return None
         # world pickup icon
         ws = cv2.resize(img, (world_size, world_size), interpolation=cv2.INTER_AREA)
-        # HUD icon (smaller)
-        ss = cv2.resize(img, (slot_size, slot_size), interpolation=cv2.INTER_AREA)
-        return ws, ss
+        return ws
 
     item_world_sprites = [None] * 2
-    item_slot_icons = [None] * 2
     item_paths = [
         "img/HP_portion.png",     # 0: heal
         "img/Attack_portion.png", # 1: attack up
     ]
     for idx, p in enumerate(item_paths):
-        ws, ss = _load_item_rgba(p)
-        item_world_sprites[idx] = ws
-        item_slot_icons[idx] = ss
+        item_world_sprites[idx] = _load_item_rgba(p)
 
     # --- Prebuild AT-field style overlays ---
     hex_overlay = build_hex_overlay(SCR_W, SCR_H, cell=42, line_th=1, color=(0,165,255))  # orange-ish
@@ -993,8 +932,6 @@ def main():
         dt = float(np.clip(now_time - prev_time, 1e-4, 0.25))
         prev_time = now_time
         # 定速ループ（OpenCV waitKey とは別に実時間 delta を参照）
-        if pvp_mode:
-            pass
 
         with net.lock:
             x = net.latest["x"]
@@ -1068,8 +1005,7 @@ def main():
                 pending_enemy_events.append((evt, payload))
 
         if (
-            pvp_mode
-            and is_authority
+            is_authority
             and local_calib_ready
             and remote_calib_ready
             and not calib_start_sent
@@ -1251,31 +1187,6 @@ def main():
         if eye_open_now and (not one_eye_mode):
             fps_nx = x
             fps_ny = y
-
-    # --- Item selection & use ---
-        # Selection: move right when brow_h relative value exceeds threshold, with 1s cooldown.
-        # When currently at the rightmost slot (2), the next move wraps to leftmost (0).
-        brow_high = (rel_browh > 0.18)
-        if calib_done and brow_high and (not prev_brow_high):
-            item_selected = (item_selected + 1) % 3
-        prev_brow_high = brow_high
-
-        # Use: when frown relative value is high and eyes are open (rising edge only)
-        item_use_ev = calib_done and (rel_frown > 0.50) and eye_open_now
-        if item_use_ev and not prev_item_use:
-            # Use (pop) top of stack from currently selected slot if any.
-            slot_stack = item_slots[item_selected]
-            if slot_stack:
-                kind = slot_stack.pop()
-                # 0: HP potion  -> recover 2 HP (up to max)
-                if kind == 0:
-                    player_hp = min(player_hp_max, player_hp + 2)
-                # 1: Attack potion -> permanent attack bonus +3
-                elif kind == 1:
-                    attack_bonus += 3
-            # Blink effect when using item (even if stack is empty)
-            item_blink_until = now_t + 2.0
-        prev_item_use = item_use_ev
 
         # --- Update sliding window of closed/open ---
         if len(closed_buf) == WINDOW_N:
@@ -1735,19 +1646,8 @@ def main():
             dx = fps_x - ix_s
             dy = fps_y - iy_s
             dist2 = dx * dx + dy * dy
-            picked = False
             if dist2 <= pickup_radius * pickup_radius:
-                free_slot = None
-                for sidx in range(len(item_slots)):
-                    if len(item_slots[sidx]) == 0:
-                        free_slot = sidx
-                        break
-                if free_slot is not None:
-                    item_slots[free_slot].append(it.kind)
-                    picked = True
-            if not picked:
-                kept_items.append(it)
-            else:
+                apply_item_effect(it.kind)
                 # small sparkle on pick-up（パーティクルはワールド座標に持っておく）
                 for _ in range(10):
                     ang = random.uniform(0, 2 * math.pi)
@@ -1759,6 +1659,8 @@ def main():
                         "vy": math.sin(ang) * spd,
                         "life": life
                     })
+            else:
+                kept_items.append(it)
         items = kept_items
 
         # draw items (after deciding which ones remain)
@@ -2026,10 +1928,6 @@ def main():
             fps_y=fps_y,
             player_world_x=player_world_x,
             player_world_y=player_world_y,
-            item_slots=item_slots,
-            item_slot_icons=item_slot_icons,
-            item_selected=item_selected,
-            item_blink_until=item_blink_until,
             rel_smile=rel_smile,
             rel_frown=rel_frown,
             rel_browh=rel_browh,
