@@ -47,6 +47,19 @@ def main() -> None:
         default=6000,
         help="pvp_shooter の P2P リッスンポートのベース番号（デフォルト: 6000）",
     )
+    parser.add_argument(
+        "--player-id",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="PVP プレイ時のプレイヤー番号（1=ホスト/2=クライアント）。--local では無視される。",
+    )
+    parser.add_argument(
+        "--peer",
+        type=str,
+        default=None,
+        help="PVP 相手の host:port（player_id=2 では必須）",
+    )
     args = parser.parse_args()
 
     detect_script = base_dir / "detect_face.py"
@@ -182,13 +195,22 @@ def main() -> None:
     ]
 
     if args.pvp:
+        listen_port = args.base_listen_port
+        if args.player_id == 2 and not args.peer:
+            raise SystemExit("--player-id 2 で起動する場合は --peer host:port を指定してください。")
         shooter_cmd = [
             sys.executable,
             str(pvp_script),
             "--gaze-port",
             str(gaze_port),
+            "--listen-port",
+            str(listen_port),
+            "--player-id",
+            str(args.player_id),
             "--capture-opponent",
         ]
+        if args.peer:
+            shooter_cmd += ["--peer", args.peer]
     else:
         shooter_cmd = [sys.executable, str(single_script)]
 
